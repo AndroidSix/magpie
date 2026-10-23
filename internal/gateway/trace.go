@@ -89,12 +89,15 @@ type Route struct {
 	Order    []Weighed    `json:"order"`              // who was to try it, first first
 	Left     []Weighed    `json:"left,omitempty"`
 	Tries    []Try        `json:"tries"`
-	Done     bool         `json:"done"`
-	Status   int          `json:"status,omitempty"`
-	Error    string       `json:"error,omitempty"`
-	Millis   int64        `json:"ms,omitempty"`
-	Tokens   int          `json:"tokens,omitempty"`
-	Output   int          `json:"out,omitempty"` // of Tokens, the reply's
+	// Masked: what masking swapped in the request before it went, nil
+	// for nothing (noteMasked)
+	Masked *Masked `json:"masked,omitempty"`
+	Done   bool    `json:"done"`
+	Status int     `json:"status,omitempty"`
+	Error  string  `json:"error,omitempty"`
+	Millis int64   `json:"ms,omitempty"`
+	Tokens int     `json:"tokens,omitempty"`
+	Output int     `json:"out,omitempty"` // of Tokens, the reply's
 	// Reasoning: of Output, the reply's reasoning, which its speed leaves
 	// out (usage.DecodeOf)
 	Reasoning int `json:"reasoning,omitempty"`
@@ -160,7 +163,10 @@ func (u RouteUsage) PricingRecord() usage.Record {
 
 // GroupRef is the routing group a request asked for.
 type GroupRef struct {
-	ID       string   `json:"id"`
+	ID string `json:"id"`
+	// Ref: the id agents pick it by (provider.Group.Ref), auto/<model>
+	// for a group magpie found, which the Routing page names it by
+	Ref      string   `json:"ref,omitempty"`
 	Name     string   `json:"name"`
 	Routing  string   `json:"routing"`
 	Affinity string   `json:"affinity"`
@@ -182,6 +188,7 @@ type GroupRef struct {
 // SubGroup is a routing group in the group a request asked for.
 type SubGroup struct {
 	ID      string `json:"id"`
+	Ref     string `json:"ref,omitempty"` // as GroupRef's
 	Name    string `json:"name"`
 	Routing string `json:"routing"`
 	In      string `json:"in"`              // the group it is in
@@ -197,7 +204,7 @@ type NestedRule struct {
 
 // groupRef is the trace's g, with its models ms.
 func groupRef(g provider.Group, ms []provider.Member) *GroupRef {
-	ref := &GroupRef{ID: g.ID, Name: g.Name, Routing: g.Routing, Affinity: g.Affinity, Auto: g.Auto, Sink: sinks(g.Sink, g.Routing)}
+	ref := &GroupRef{ID: g.ID, Ref: g.Ref(), Name: g.Name, Routing: g.Routing, Affinity: g.Affinity, Auto: g.Auto, Sink: sinks(g.Sink, g.Routing)}
 	seen := map[string]bool{}
 	for _, m := range ms {
 		ref.Members = append(ref.Members, provider.WithMemberEffort(m.Provider.ID+"/"+m.Model, m.Effort))
@@ -209,7 +216,7 @@ func groupRef(g provider.Group, ms []provider.Member) *GroupRef {
 		for _, v := range m.Via {
 			if !seen[v.ID] {
 				seen[v.ID] = true
-				ref.Subs = append(ref.Subs, SubGroup{ID: v.ID, Name: v.Name, Routing: v.Routing, In: in, Rules: len(v.Rules)})
+				ref.Subs = append(ref.Subs, SubGroup{ID: v.ID, Ref: v.Ref(), Name: v.Name, Routing: v.Routing, In: in, Rules: len(v.Rules)})
 			}
 			in = v.ID
 		}
@@ -249,6 +256,7 @@ type Weighed struct {
 	Pace     float64           `json:"pace,omitempty"`   // remaining allowance per hour until its window resets
 	Due      *time.Time        `json:"due,omitempty"`    // when the allowance window used for pace resets
 	Tokens   float64           `json:"tokens,omitempty"` // least used: tokens it served lately
+	Free     bool              `json:"free,omitempty"`   // its model costs nothing there (free first)
 	Turn     bool              `json:"turn,omitempty"`   // in turn: it was this one's turn
 	Fit      int               `json:"fit,omitempty"`    // keyFit
 	Speaks   provider.Protocol `json:"speaks,omitempty"` // a key made for one protocol only
@@ -274,6 +282,10 @@ type Weighed struct {
 	// NoCredits: held at 100% (Capped), a Codex account the user set not
 	// to spend its credits once its allowance is used up
 	NoCredits bool `json:"noCredits,omitempty"`
+	// Credits: a Codex account that goes on past its allowance on its
+	// credits, and is let spend them: all but used up, it still answers,
+	// and goes before those used up with nothing to go on with
+	Credits bool `json:"credits,omitempty"`
 	// Rank: its place in its provider's own list of accounts or keys, the
 	// order the provider's page shows and a drag sets (#217); routing may
 	// weigh them in another
@@ -366,6 +378,10 @@ type Try struct {
 	// Codex resets was spent by itself (the user's setting) — on Who, and
 	// what spending it did — and the request asked again
 	Reset *AutoReset `json:"reset,omitempty"`
+	// Credits: a Codex account that holds credits, refused as out of its
+	// allowance, was asked again at once, for the vendor to spend its
+	// credits on the turn (creditsAgain)
+	Credits bool `json:"credits,omitempty"`
 	// Auto: the models Copilot's Auto picked for it, in turn — where each
 	// pick came from and Copilot's refusal of it — Model being "auto"
 	Auto []provider.AutoPick `json:"auto,omitempty"`
@@ -420,7 +436,7 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 		w.Kind = "provider"
 	}
 	if l, ok := wg.lefts[c.allowanceKey()]; ok {
-		w.Known, w.Used, w.Renews, w.Pace = true, l.used, l.renews, l.pace
+		w.Known, w.Used, w.Renews, w.Pace, w.Credits = true, l.used, l.renews, l.pace, l.credits
 		if !l.fullest.IsZero() {
 			ur := l.fullest
 			w.UsedRenews = &ur
@@ -443,6 +459,9 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 	}
 	if wg.tokens != nil {
 		w.Tokens = wg.tokens[c.rest]
+	}
+	if wg.free != nil {
+		w.Free = wg.free[c.rest]
 	}
 	if sinks(p.Sink, p.Routing) {
 		markSunk(&w, c)
@@ -485,6 +504,10 @@ type TraceState struct {
 	Seq    int64   `json:"seq"`
 	Routes []Route `json:"routes"`
 	Totals Totals  `json:"totals"`
+	// IDs are every route the trace keeps now, changed or not: a page that
+	// stopped reading while out of sight drops a request it last heard of
+	// under way that has since ended and gone from the trace
+	IDs []int64 `json:"ids,omitempty"`
 	// By is the magpie whose routing this is, when it is another magpie's
 	// (OwnerTrace): the console names it from here, so the name follows the
 	// trace when another magpie takes the gateway over (#2606)
@@ -620,6 +643,16 @@ func (t *trace) trim() {
 }
 
 // update changes a route under the lock.
+// maskedOf is r's Masked, read under the lock.
+func (t *trace) maskedOf(r *Route) *Masked {
+	if r == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return r.Masked
+}
+
 func (t *trace) update(r *Route, f func(r *Route)) {
 	if r == nil {
 		return
@@ -673,7 +706,7 @@ func (s *Server) gatewayTrace(w http.ResponseWriter, r *http.Request) {
 		wait = 25 * time.Second
 	}
 	st := s.Trace(r.Context(), after, wait)
-	writeJSON(w, 200, map[string]any{"object": "trace", "now": time.Now(), "seq": st.Seq, "routes": st.Routes, "totals": st.Totals, "pid": os.Getpid(), "serves": Serves})
+	writeJSON(w, 200, map[string]any{"object": "trace", "now": time.Now(), "seq": st.Seq, "routes": st.Routes, "totals": st.Totals, "ids": st.IDs, "pid": os.Getpid(), "serves": Serves})
 }
 
 // ownerURL is the gateway's address on loopback, where the magpie serving
@@ -737,13 +770,14 @@ func OwnerTrace(ctx context.Context, after int64, wait time.Duration) (TraceStat
 		Seq    int64   `json:"seq"`
 		Routes []Route `json:"routes"`
 		Totals Totals  `json:"totals"`
+		IDs    []int64 `json:"ids"`
 		Pid    int     `json:"pid"`
 		Serves string  `json:"serves"`
 	}
 	if decodeJSON(b, &out) != nil || out.Object != "trace" || out.Routes == nil {
 		return TraceState{}, false
 	}
-	return TraceState{Seq: out.Seq, Routes: out.Routes, Totals: out.Totals, By: &TraceBy{Pid: out.Pid, Serves: out.Serves}}, true
+	return TraceState{Seq: out.Seq, Routes: out.Routes, Totals: out.Totals, IDs: out.IDs, By: &TraceBy{Pid: out.Pid, Serves: out.Serves}}, true
 }
 
 // OwnerLanes reads the lanes of the magpie serving the gateway's address, for
@@ -788,8 +822,9 @@ func (s *Server) Trace(ctx context.Context, after int64, wait time.Duration) Tra
 		if t.seq < after {
 			after = 0 // the gateway started over since
 		}
-		st := TraceState{Seq: t.seq, Routes: []Route{}, Totals: t.totals}
+		st := TraceState{Seq: t.seq, Routes: []Route{}, Totals: t.totals, IDs: make([]int64, 0, len(t.routes))}
 		for _, r := range t.routes {
+			st.IDs = append(st.IDs, r.ID)
 			if r.Seq > after {
 				c := *r
 				c.Order = append([]Weighed{}, r.Order...) // [] for none: the GUI reads it as a list
@@ -810,6 +845,16 @@ func (s *Server) Trace(ctx context.Context, after int64, wait time.Duration) Tra
 		t.mu.Unlock()
 		select {
 		case <-wake:
+			// a request's way is told in a burst (begun, its prompt read,
+			// a try sent, answered, its usage), each change waking every
+			// page waiting: gathered a moment, a page hears of the burst
+			// once, not 4-8 times a second while agents are busy
+			gather := time.NewTimer(traceGather)
+			select {
+			case <-gather.C:
+			case <-ctx.Done():
+				gather.Stop()
+			}
 		case <-deadline.C:
 			return st
 		case <-ctx.Done():
@@ -817,6 +862,10 @@ func (s *Server) Trace(ctx context.Context, after int64, wait time.Duration) Tra
 		}
 	}
 }
+
+// traceGather is how long a waiting Trace gathers changes after the first
+// one wakes it.
+var traceGather = 250 * time.Millisecond
 
 // swapped reports whether served is another model than sent: not the same
 // name, however dated, pinned or prefixed (usage.Swapped).

@@ -1106,6 +1106,11 @@ func modelRetired(status int, body []byte) bool {
 	default:
 		return false
 	}
+	// the safety filter turning the request away (#3274) is about the
+	// request, whatever its message says of the model
+	if _, refused := policyRefusal(body); refused {
+		return false
+	}
 	// the words are matched decoded, too (#1669)
 	body = wordsOf(body)
 	return retiredWords.Match(body) && !quotaWords.Match(body)
@@ -1612,6 +1617,10 @@ type holdWriter struct {
 	// thinkingShown: the model's vendor never refuses after reasoning
 	// (refusesAfterThinking), so its reasoning goes through as it comes
 	thinkingShown bool
+	// thoughtThrough: the try went through on its reasoning alone
+	// (thinkingShown) while the request could still have asked again, so
+	// an empty reply is asked again in place as often (emptyRetries)
+	thoughtThrough bool
 
 	ended bool   // the stream's last event was written: the reply is whole
 	tail  []byte // the end of the last write, for a marker split across two
@@ -2025,6 +2034,7 @@ func (h *holdWriter) scan() {
 			continue
 		case eventThinking:
 			if h.thinkingShown && !h.wantWhole {
+				h.thoughtThrough = h.hold
 				h.flow()
 				return
 			}
@@ -2338,6 +2348,14 @@ func (h *holdWriter) mayAskAgain() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.hold && !h.passing
+}
+
+// thoughtOnly tells whether the try went through on its reasoning while
+// it was still held for the request to ask again (thoughtThrough).
+func (h *holdWriter) thoughtOnly() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.thoughtThrough
 }
 
 // handBack sends a refusal held with nothing said as the vendor's own
@@ -3098,6 +3116,30 @@ func policyRefusal(raw []byte) (string, bool) {
 // error's own message is matched, and only whole: an answer quoting it is
 // an answer.
 const highRiskRefusal = "The request was rejected because it was considered high risk"
+
+// filterRefused is a stream's error event (its data) as an Event carries
+// it when it is the vendor's safety filter refusing the request: its code
+// (refusedCode), status refusedStatus, and an error of the request's own
+// (Said) with that code. A client answered whole is then told it as a 400
+// refusal, which the hold reads as one (policyRefusal) and asks the next
+// account, resting nobody; without the status it was answered 502
+// api_error, asked again on every account, and each one rested (#3274: a
+// Codex account's response.failed cyber_policy, its error with no type).
+// A code policyRefusal doesn't know as a refusal goes as content_filter,
+// for the hold to know it still. Not a refusal, it is "", 0 and nil.
+func filterRefused(data string) (string, int, json.RawMessage) {
+	code := refusedCode(data)
+	if code == "" {
+		return "", 0, nil
+	}
+	said := code
+	c, _ := json.Marshal(map[string]string{"code": code})
+	if _, ok := policyRefusal(c); !ok {
+		said = "content_filter"
+	}
+	b, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "invalid_request_error", "code": said}})
+	return code, refusedStatus, b
+}
 
 // refusedCode is the code of a stream's error event (its data) when it is
 // the vendor's safety filter refusing, for a translation of it to keep:

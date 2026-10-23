@@ -10,7 +10,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
-const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
+const { wheelTo, watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const size = 1637572192;
@@ -75,7 +75,7 @@ async function open(engine, lang, width, masking, model, posts) {
 // what the row shows: its words, whether they are cut, and that it is
 // inside the list
 const look = (page) => page.evaluate(() => {
-  const r = document.querySelector("#privacyModelRow"), list = document.querySelector("#redactList").getBoundingClientRect();
+  const r = document.querySelector("#privacyModelRow"), list = r.closest(".list").getBoundingClientRect();
   const sub = r.querySelector(".sub"), b = r.getBoundingClientRect(), v = r.querySelector(".val").getBoundingClientRect();
   return {
     name: r.querySelector(".name").textContent, sub: sub.textContent,
@@ -134,6 +134,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const { browser, page, errors } = await open(engine, "en", 1100, true, model, posts);
     t.after(() => browser.close());
     const row = page.locator("#privacyModelRow");
+    await wheelTo(page, row, 300); // under the masking card; WebKit's own scroll-into-view misses it
     await row.locator(".segs .opt", { hasText: "On" }).click();
     await row.locator("button.text", { hasText: "Cancel" }).click();
     await page.waitForFunction(() => document.querySelector("#privacyModelRow .segs .opt.on")?.textContent === "Off");
@@ -141,6 +142,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
     Object.assign(model, { installed: true, on: false });
     await page.reload();
+    await wheelTo(page, row.locator("button.text", { hasText: "Delete model" }), 300);
     await row.locator("button.text", { hasText: "Delete model" }).click();
     await page.locator("dialog.action-confirm button", { hasText: /^Delete$/ }).click();
     await page.waitForFunction(() => !document.querySelector("#privacyModelRow button.text"));
@@ -149,11 +151,18 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     assert.deepEqual(errors, []);
   });
 
-  test(`${engine}: no model row while nothing is masked, and none to turn on where it can't run`, async (t) => {
+  test(`${engine}: while nothing is masked the model row waits under Rules, and none to turn on where it can't run`, async (t) => {
     const { browser, page, errors } = await open(engine, "en", 1100, false, { supported: true, size }, []);
     t.after(() => browser.close());
     await page.locator("#redactList .row", { hasText: "Mask personal data" }).waitFor();
-    assert.equal(await page.locator("#privacyModelRow").count(), 0);
+    // How it's found: the rules first, then the model, both waiting on
+    // something to mask, with nothing to press
+    const found = await page.$$eval("#findList > .row", (rs) => rs.map((r) => [r.id, r.querySelector(".name").textContent, r.querySelector(".sub").textContent, r.querySelectorAll("button").length]));
+    assert.deepEqual(found, [
+      ["maskRulesRow", "Rules", "Turn on Mask secrets or Mask personal data first", 0],
+      ["privacyModelRow", "Find with a local model", "Turn on Mask secrets or Mask personal data first", 0],
+    ]);
+    assert.equal(await page.locator("#privacyModelRow.pm-wait").count(), 1);
     await browser.close();
 
     const two = await open(engine, "en", 1100, true, { supported: false, size }, []);

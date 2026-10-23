@@ -688,7 +688,8 @@ func addCmd(p provider.Provider) tea.Cmd {
 
 // endpointAsk asks for the address of a vendor reached at the user's own
 // (pr.Endpoint is its example): a remote magpie's, as the other
-// computer's magpie shows it in Settings, under Share on local network.
+// computer's magpie shows it in Settings → Network and sharing, under
+// Share on local network.
 // Nothing typed is said to be needed, as the app's editor says it.
 func endpointAsk(pr provider.PresetDef, crumbs []string, now string, then func(string) tea.Cmd) ask {
 	in := newInput(pr.Endpoint)
@@ -729,6 +730,9 @@ func localAddressAsk(pr provider.PresetDef, crumbs []string, now string, then fu
 // listError is provider.Provider.ListError; tests stand in for it.
 var listError = provider.Provider.ListError
 
+// signedOut is Provider.SignedOut, for a test to stand in for.
+var signedOut = provider.Provider.SignedOut
+
 func (m model) viewProviders() string {
 	var b strings.Builder
 	b.WriteString(m.header())
@@ -750,6 +754,9 @@ func (m model) viewProviders() string {
 		switch {
 		case p.Off:
 			r.key = "○ switched off"
+		case p.Account != nil && signedOut(p):
+			// every account in use refused, as magpie providers says it
+			r.key = "○ " + p.Account.User + " is signed out"
 		case p.Account != nil:
 			r.key = "● " + p.Account.User
 		case p.IsVertex() && !p.Ready():
@@ -834,7 +841,7 @@ func quotasCmd() tea.Msg {
 	defer cancel()
 	// a WorkBuddy (China) account's line says how its daily check-in went,
 	// as its card in the app does
-	return quotaMsg(provider.WithCheckins(provider.Quotas(ctx)))
+	return quotaMsg(provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx))))
 }
 
 // checkinMsg is what came of c, WorkBuddy's daily check-in pressed now.
@@ -941,6 +948,13 @@ func checkinWords(r provider.WorkBuddyCheckin) string {
 		who = "WorkBuddy"
 	}
 	switch r.Outcome {
+	case provider.CheckinDone, provider.CheckinInactive, provider.CheckinIneligible:
+		if r.Again {
+			// maybe the vendor's day before (#3326)
+			return who + ": " + againWords(r)
+		}
+	}
+	switch r.Outcome {
 	case provider.CheckinClaimed, provider.CheckinDone:
 		s := who + " checked in today"
 		if r.Credit > 0 {
@@ -967,6 +981,18 @@ func checkinWords(r provider.WorkBuddyCheckin) string {
 		msg = "no answer"
 	}
 	return who + " couldn't check in: " + msg
+}
+
+// againWords is a provisional answer (WorkBuddyCheckin.Again) in words:
+// it may be the vendor's day before, so magpie asks again later (#3326).
+func againWords(r provider.WorkBuddyCheckin) string {
+	switch r.Outcome {
+	case provider.CheckinDone:
+		return "says already checked in · its day may not have turned, magpie asks again later"
+	case provider.CheckinIneligible:
+		return "not eligible now · magpie asks again later"
+	}
+	return "no check-in event now · magpie asks again later"
 }
 
 // ownAppName is the vendor whose own app alone gets r's check-in credits.
@@ -1003,6 +1029,10 @@ func checkinCell(q provider.SubscriptionQuota, now time.Time) string {
 	r := q.Checkin
 	if r == nil || r.Day != provider.CheckinDay(now) {
 		return sMuted.Render("签到 not yet today · c")
+	}
+	if r.Again && r.Outcome == provider.CheckinDone {
+		// "already in" that may be the vendor's day before (#3326)
+		return sMuted.Render("签到 said already · asked again later · c")
 	}
 	switch r.Outcome {
 	case provider.CheckinClaimed, provider.CheckinDone:

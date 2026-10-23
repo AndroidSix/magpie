@@ -24,12 +24,15 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/yetone/magpie/internal/appdir"
@@ -146,6 +149,9 @@ type Session struct {
 	// WSL is the WSL distro the session ran in, its files read through
 	// \\wsl.localhost (see wsl.go); "" for this computer's own
 	WSL string `json:"wsl,omitempty"`
+	// Convs are the ids magpie's gateway keys the session's requests by
+	// when they carry no session id of their own (dshConvs)
+	Convs []string `json:"-"`
 }
 
 // PriceOf is the effective price of a model as a session names it, at the
@@ -190,6 +196,7 @@ type state struct {
 	Named                 string            `json:"named,omitempty"`  // the agent's own title for it
 	Custom                string            `json:"custom,omitempty"` // the name the user gave it
 	First                 string            `json:"first,omitempty"`  // the first message, when no prompt looked typed
+	Convs                 []string          `json:"convs,omitempty"`  // the gateway's ids for its requests (dshConvs)
 	Start                 time.Time         `json:"start"`
 	Last                  time.Time         `json:"last"`
 	Models                map[string]Tokens `json:"models,omitempty"`
@@ -360,6 +367,7 @@ func (s *state) clone() *state {
 		t := *s.Total
 		c.Total = &t
 	}
+	c.Convs = slices.Clone(s.Convs)
 	c.CodexSpawnNames = maps.Clone(s.CodexSpawnNames)
 	c.CodexSpawnConflicts = maps.Clone(s.CodexSpawnConflicts)
 	c.CodexAgentIDs = maps.Clone(s.CodexAgentIDs)
@@ -496,6 +504,22 @@ func allFiles() []file {
 		grokFiles(), workbuddyFiles(), codebuddyFiles(), droidFiles(), ompFiles(), cursorFiles(), hermesFiles(), almaFiles(), kimiFiles()} {
 		out = append(out, fs...)
 	}
+	return distinctPaths(out)
+}
+
+// distinctPaths is fs with each path kept once, the first time it is
+// listed. A path is one file to read and count: a session a database
+// holds twice under one id (a TEXT and a BLOB row, #2932), or a folder
+// two agents are told to share, would otherwise be counted twice.
+func distinctPaths(fs []file) []file {
+	seen := make(map[string]bool, len(fs))
+	out := fs[:0]
+	for _, f := range fs {
+		if !seen[f.path] {
+			seen[f.path] = true
+			out = append(out, f)
+		}
+	}
 	return out
 }
 
@@ -503,6 +527,7 @@ func allFiles() []file {
 // Codex's, and the other agents' where they keep sessions on this computer.
 func Dirs() []string {
 	out := []string{ClaudeDir(), CodexDir()}
+	var named []os.FileInfo
 	for _, d := range []struct{ dir, sessions string }{
 		{OpenCodeDir(), OpenCodeDir()},
 		{PiDir(), PiDir()},
@@ -523,9 +548,18 @@ func Dirs() []string {
 		{MiniMaxDir(), minimaxSessions()},
 		{KimiCodeDir(), kimiSessions()},
 	} {
-		if _, err := os.Stat(d.sessions); err == nil {
-			out = append(out, d.dir)
+		if _, err := os.Stat(d.sessions); err != nil {
+			continue
 		}
+		// a folder two agents share is named once
+		// (CODEBUDDY_CONFIG_DIR set to ~/.workbuddy, #2932)
+		if fi, err := os.Stat(d.dir); err == nil {
+			if slices.ContainsFunc(named, func(o os.FileInfo) bool { return os.SameFile(o, fi) }) {
+				continue
+			}
+			named = append(named, fi)
+		}
+		out = append(out, d.dir)
 	}
 	out = append(out, HermesDirs()...)
 	out = append(out, wslDirs()...)
@@ -656,7 +690,8 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 19: the names the user gave Claude Code's and WorkBuddy's (custom-title).
 // 20: Codex's source and direct parent thread identity.
 // 21: Codex subagent nicknames and parent spawn task names.
-const cacheVersion = 21
+// 22: dsh's gateway conversation ids (Convs).
+const cacheVersion = 22
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -787,13 +822,18 @@ func refresh(want, all []file) {
 		}
 		if s := cache[f.path]; s == nil || s.Size != f.size || s.Mod != f.mod.UnixNano() || (f.agent == "hermes" && (f.hermes == nil || f.rev == "" || s.DBRevision != f.rev)) || ((f.agent == "alma" || f.agent == "cursor") && s.DBRevision != f.rev) {
 			if parsing[f.path] != nil {
-				// another refresh is reading it: its last parse stands
-				// until that one is in, and one never read is waited for
+				// a refresh is reading it, another or this one (a path
+				// listed twice): its last parse stands until that one is
+				// in, and one never read is waited for
 				if s == nil {
 					waits = append(waits, f)
 				}
 				continue
 			}
+			// marked as it is taken, so a second listing of the path is
+			// not a second job: two jobs shared one entry, and the second
+			// publish closed a nil channel (#2932)
+			parsing[f.path] = make(chan struct{})
 			todo = append(todo, f)
 		}
 	}
@@ -842,7 +882,6 @@ func refresh(want, all []file) {
 	jobs := make([]job, len(todo))
 	for i, f := range todo {
 		jobs[i] = job{f: f, old: cache[f.path]}
-		parsing[f.path] = make(chan struct{})
 	}
 	generation := cacheGeneration
 	mu.Unlock()
@@ -852,12 +891,15 @@ func refresh(want, all []file) {
 		go func() {
 			for i := range ch {
 				j := &jobs[i]
+				// its file's calls lock is taken before a read slot, as
+				// readCalls takes them
+				calls := callsAlong(j.f)
 				release := readSlot()
 				end := readBegin()
 				if parseHook != nil {
 					parseHook()
 				}
-				j.parsed = parse(j.f, j.old)
+				j.parsed = parseWith(j.f, j.old, calls)
 				end()
 				release()
 				if (j.parsed.Claude != nil && !windows[j.f.path]) || (j.parsed.Claude == nil && !recentRevision(j.parsed.Mod, j.parsed.revisionWeight(), time.Now())) {
@@ -1063,6 +1105,18 @@ func Reset() {
 // List reads the latest sessions of every agent, the most recently active
 // first, at most limit of them (Limit when 0).
 func List(limit int) []Session {
+	// read before the locks: it reads settings.json
+	alias := provider.UsageAlias()
+	out := listSessions(limit)
+	if alias != nil {
+		for i := range out {
+			aliasSession(&out[i], alias)
+		}
+	}
+	return out
+}
+
+func listSessions(limit int) []Session {
 	storeMu.RLock()
 	defer storeMu.RUnlock()
 	if limit <= 0 {
@@ -1144,6 +1198,26 @@ func sessionID(fs []file) string {
 
 // assemble puts a session together from its files' parses.
 func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
+	s, ok := assembleListed(fs, price)
+	if !ok {
+		return s, false
+	}
+	if !s.ReadOnly {
+		s.Resume = resumeCommand(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
+	}
+	s.Carry, s.Transcript = carries(s), HasTranscript(s.Agent)
+	if s.Transcript {
+		s.Subagents = subagentsOf(s, fs)
+	}
+	return s, true
+}
+
+// assembleListed is assemble without what only a listed session's row shows (how
+// to resume it, its subagents): whether List lists the session, and its
+// agent, id, title and usage. The stats ask it of every session on each
+// poll, and building every session's subagents there read each Claude Code
+// subagent's file again (3.5 GB of a live magpie's 6.3 GB of scans).
+func assembleListed(fs []file, price func(string) *catalog.Price) (Session, bool) {
 	sortSessionFiles(fs)
 	s := Session{Agent: fs[0].agent, Path: fs[0].path, Models: []Model{}, WSL: fs[0].wsl}
 	for _, f := range fs {
@@ -1173,6 +1247,7 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 			if first == "" {
 				first = st.First
 			}
+			s.Convs = append(s.Convs, st.Convs...)
 		}
 		if s.Agent == "codex" && st.CodexNickname != "" {
 			s.Nickname = st.CodexNickname
@@ -1227,13 +1302,6 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 	if s.Title == "" && s.Tokens.zero() {
 		return s, false // nothing was said in it
 	}
-	if !s.ReadOnly {
-		s.Resume = resumeCommand(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
-	}
-	s.Carry, s.Transcript = carries(s), HasTranscript(s.Agent)
-	if s.Transcript {
-		s.Subagents = subagentsOf(s, fs)
-	}
 	return s, true
 }
 
@@ -1280,7 +1348,14 @@ func parserFor(agent string) sessionParser {
 }
 
 // parse reads a file on from where old left it, or from the start.
-func parse(f file, old *state) *state {
+func parse(f file, old *state) *state { return parseWith(f, old, nil) }
+
+// parseWith is parse with calls, when not nil, reading the file's calls on
+// the same pass.
+func parseWith(f file, old *state, calls *callsRide) *state {
+	if calls != nil {
+		defer calls.release()
+	}
 	// Summary caches contain aggregates only. After a restart, a changed
 	// Codex file rebuilds its transient response index from the source.
 	if f.agent == "codex" && old != nil && old.Codex == nil {
@@ -1312,12 +1387,19 @@ func parse(f file, old *state) *state {
 	if f.agent == "codex" {
 		head = func(b []byte) bool { return codexHead(s, b, f.main) }
 	}
-	off, err := scanAt(f.path, s.Off, head, func(b []byte, _, _ int64) bool {
+	line := func(b []byte, _, _ int64) bool {
 		parser.line(s, b, f.main)
 		return true
-	})
+	}
+	if calls != nil {
+		head, line = calls.ride(head, line)
+	}
+	off, err := scanAt(f.path, s.Off, head, line)
 	if err == nil {
 		s.Off = off
+	}
+	if calls != nil {
+		calls.finish(off, err)
 	}
 	if isBuddy(f.agent) && s.Cwd == "" {
 		workbuddyMeta(s, f.path)
@@ -1365,14 +1447,25 @@ func scanAt(path string, off int64, head func([]byte) bool, fn func(b []byte, st
 		if _, err := s.Seek(off, io.SeekStart); err != nil {
 			return off, err
 		}
-	} else if _, err := io.CopyN(io.Discard, f, off); err != nil {
-		if errors.Is(err, io.EOF) {
-			return off, nil
-		}
-		return off, err
 	}
-	r := bufio.NewReaderSize(f, scanBuffer(f, off))
+	r, release := lineReader(f, scanBuffer(f, off))
+	defer release()
+	if _, ok := f.(io.Seeker); !ok && off > 0 {
+		// passed over through the reader the lines are read with, not a
+		// copy's buffer of its own
+		if _, err := r.Discard(int(off)); err != nil {
+			if errors.Is(err, io.EOF) {
+				return off, nil
+			}
+			return off, err
+		}
+	}
+	pf, plain := f.(*os.File)
 	var long []byte
+	var kept *[]byte // long's buffer, from longLines
+	defer func() { giveLong(kept, long) }()
+	var parts blocks // a packed file's long line so far
+	defer parts.release()
 	var n int64 // bytes of the line so far
 	skip, seen := false, false
 	for {
@@ -1383,10 +1476,28 @@ func scanAt(path string, off int64, head func([]byte) bool, fn func(b []byte, st
 				seen = true
 				skip = skip || !head(chunk)
 			}
-			if !skip && len(long)+len(chunk) <= maxLine {
-				long = append(long, chunk...)
-			} else {
+			if plain && !skip && len(long) == 0 {
+				// gathered in one buffer of the line's own size, not grown a
+				// chunk at a time (~5 times the line allocated, #2515)
+				if l := lineLen(pf, off, maxLine+r.Size()); l > maxLine+r.Size() {
+					skip = true
+				} else if l > cap(long) {
+					kept, long = takeLong(l)
+				}
+			}
+			switch {
+			case skip || len(long)+parts.n+len(chunk) > maxLine:
 				skip, long = true, long[:0]
+				parts.release()
+			case plain:
+				long = append(long, chunk...)
+			default:
+				// a packed file's line has no length to read ahead: it is
+				// kept in pooled blocks until its end, then gathered once
+				// at its own size. Grown by append it allocated ~3.8 times
+				// the line, most of what a cold read of packed rollouts
+				// with pasted images allocated.
+				parts.add(chunk)
 			}
 			continue
 		}
@@ -1395,6 +1506,13 @@ func scanAt(path string, off int64, head func([]byte) bool, fn func(b []byte, st
 				return off, nil
 			}
 			return off, err
+		}
+		if parts.n > 0 {
+			if l := parts.n + len(chunk); l > cap(long) {
+				kept, long = takeLong(l)
+			}
+			long = parts.appendTo(long[:0])
+			parts.release()
 		}
 		b := chunk
 		if len(long) > 0 {
@@ -1411,6 +1529,115 @@ func scanAt(path string, off int64, head func([]byte) bool, fn func(b []byte, st
 		off += n
 		n, skip, seen, long = 0, false, false, long[:0]
 	}
+}
+
+// longLines keep the buffers scanAt gathers long lines in between scans:
+// a line handed out from one is only good until the scan ends, as one
+// from its read buffer is.
+var longLines sync.Pool
+
+// takeLong is an empty buffer of at least l bytes, from the pool when it
+// has one that large (the one a scan had, too small, is let go).
+func takeLong(l int) (*[]byte, []byte) {
+	if p, ok := longShelf.take(func(p *[]byte) bool { return cap(*p) >= l }); ok {
+		return p, (*p)[:0]
+	}
+	if p, _ := longLines.Get().(*[]byte); p != nil {
+		if cap(*p) >= l {
+			return p, (*p)[:0]
+		}
+		longLines.Put(p)
+	}
+	b := make([]byte, 0, l)
+	return &b, b
+}
+
+// giveLong gives the buffer long was gathered in back to the pool.
+func giveLong(p *[]byte, long []byte) {
+	if p == nil {
+		return
+	}
+	*p = long[:cap(long)]
+	if poisonReleased {
+		for i := range *p {
+			(*p)[i] = 0xFF
+		}
+	}
+	*p = (*p)[:0]
+	if cap(*p) <= longShelved {
+		// kept in place of a smaller one when the shelf is full
+		out, kept, swapped := longShelf.give(p, func(h, p *[]byte) bool { return cap(*h) < cap(*p) })
+		if !kept {
+			longLines.Put(p)
+		} else if swapped {
+			longLines.Put(out)
+		}
+		return
+	}
+	longLines.Put(p)
+}
+
+// longShelf keeps long-line buffers up to longShelved bytes across garbage
+// collections; a longer one, rare, is left to longLines.
+var longShelf shelf[*[]byte]
+
+const longShelved = 4 << 20
+
+// blocks hold a long line read from a packed file until its end is found:
+// copied into 1 MiB blocks kept between scans, so the line is allocated
+// only once, at its own length.
+type blocks struct {
+	b []*[]byte
+	n int // bytes held
+}
+
+var gatherBlocks = sync.Pool{New: func() any { b := make([]byte, 0, 1<<20); return &b }}
+
+func (g *blocks) add(p []byte) {
+	g.n += len(p)
+	for len(p) > 0 {
+		if len(g.b) == 0 || len(*g.b[len(g.b)-1]) == cap(*g.b[len(g.b)-1]) {
+			g.b = append(g.b, gatherBlocks.Get().(*[]byte))
+		}
+		last := g.b[len(g.b)-1]
+		k := min(len(p), cap(*last)-len(*last))
+		*last = append(*last, p[:k]...)
+		p = p[k:]
+	}
+}
+
+func (g *blocks) appendTo(dst []byte) []byte {
+	for _, b := range g.b {
+		dst = append(dst, *b...)
+	}
+	return dst
+}
+
+func (g *blocks) release() {
+	for _, b := range g.b {
+		*b = (*b)[:0]
+		gatherBlocks.Put(b)
+	}
+	g.b, g.n = g.b[:0], 0
+}
+
+// lineLen is the length, its newline included, of the line at off in f,
+// read ahead without moving f: 0 when it has no end yet, and past most
+// (but no further) for a longer one.
+func lineLen(f *os.File, off int64, most int) int {
+	buf := make([]byte, 64<<10)
+	n := 0
+	for n <= most {
+		k, err := f.ReadAt(buf, off+int64(n))
+		if i := bytes.IndexByte(buf[:k], '\n'); i >= 0 {
+			return n + i + 1
+		}
+		n += k
+		if err != nil {
+			return 0
+		}
+	}
+	return n
 }
 
 // scanBuffer is the read buffer a reader of f needs for what is left of it
@@ -1430,6 +1657,59 @@ func scanBuffer(f io.Reader, off int64) int {
 	return most
 }
 
+// lineReaders keep scanAt's read buffers between scans, one pool per
+// power-of-two size from scanBuffer's 16 KiB to its 1 MiB. Every scan
+// allocated its own: a live magpie's start read ~3,200 Claude Code subagent
+// files for their first lines (ccTask), most over 1 MiB, and with the
+// session and call reads scanAt allocated 6.3 GB in 48 minutes, 3.8 GB of
+// it these buffers, while ~157 MB was live. A pool keeps about one buffer
+// per reader running at once, and lets idle ones go at the next GCs.
+var lineReaders [7]sync.Pool
+
+// lineShelves keep a few of each first, across garbage collections.
+var lineShelves [7]shelf[*bufio.Reader]
+
+// poisonReleased, set by the tests, fills a buffer given back with 0xFF, so
+// a reader that kept a line past its scan reads garbage and fails.
+var poisonReleased = false
+
+// lineReader is a reader of f with a buffer of at least size bytes (at
+// most 1 MiB); release gives the buffer back. A line handed out from it is
+// only good until release: one kept longer is copied.
+func lineReader(f io.Reader, size int) (*bufio.Reader, func()) {
+	class := 0
+	for class < len(lineReaders)-1 && 16<<10<<class < size {
+		class++
+	}
+	r, _ := lineShelves[class].take(nil)
+	if r == nil {
+		r, _ = lineReaders[class].Get().(*bufio.Reader)
+	}
+	if r == nil {
+		r = bufio.NewReaderSize(nil, 16<<10<<class)
+	}
+	r.Reset(f)
+	return r, func() {
+		if poisonReleased {
+			r.Reset(poison{})
+			r.Peek(r.Size())
+		}
+		r.Reset(nil)
+		if _, kept, _ := lineShelves[class].give(r, nil); !kept {
+			lineReaders[class].Put(r)
+		}
+	}
+}
+
+type poison struct{}
+
+func (poison) Read(b []byte) (int, error) {
+	for i := range b {
+		b[i] = 0xFF
+	}
+	return len(b), nil
+}
+
 // packed says whether a session file is compressed: a Codex rollout the
 // Codex app has packed (.zst), a dsh session (.zstd). A packed rollout is
 // written whole, so it is read whole again whenever it changes.
@@ -1443,22 +1723,56 @@ func openLines(path string) (io.ReadCloser, error) {
 	if err != nil || !packed(path) {
 		return f, err
 	}
-	d, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
-	if err != nil {
+	d, ok := streamShelf.take(nil)
+	if !ok {
+		d = streams.Get().(*zstd.Decoder)
+	}
+	if err := d.Reset(f); err != nil {
 		f.Close()
 		return nil, err
 	}
-	return zstdFile{d.IOReadCloser(), f}, nil
+	return &zstdFile{d: d, f: f}, nil
 }
 
-// zstdFile is a packed file's lines, closed with the file.
+// streams holds decoders between packed reads. A decoder made for each
+// read allocated its window (a packed rollout's is 2 MiB, held in 3 MiB at
+// low memory) and its block buffers every time: 75 GB of a live magpie's
+// first read of 11,591 rollouts. One kept here keeps them, and is let go
+// with the pool's other idle ones by the garbage collector. streamShelf
+// keeps a few first, across collections.
+var streamShelf shelf[*zstd.Decoder]
+
+var streams = sync.Pool{New: func() any {
+	d, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+	if err != nil {
+		panic(err) // only for options it doesn't know
+	}
+	return d
+}}
+
+// zstdFile is a packed file's lines, closed with the file. Its decoder goes
+// back to the pool at Close, which a read after can't reach.
 type zstdFile struct {
-	io.ReadCloser
+	d *zstd.Decoder
 	f *os.File
 }
 
-func (z zstdFile) Close() error {
-	z.ReadCloser.Close()
+func (z *zstdFile) Read(p []byte) (int, error) {
+	if z.d == nil {
+		return 0, os.ErrClosed
+	}
+	return z.d.Read(p)
+}
+
+func (z *zstdFile) Close() error {
+	if z.d == nil {
+		return os.ErrClosed
+	}
+	z.d.Reset(nil)
+	if _, kept, _ := streamShelf.give(z.d, nil); !kept {
+		streams.Put(z.d)
+	}
+	z.d = nil
 	return z.f.Close()
 }
 
@@ -1482,21 +1796,37 @@ func tsAt(b []byte, last bool) time.Time {
 	return t
 }
 
-var (
-	space = regexp.MustCompile(`\s+`)
-	tag   = regexp.MustCompile(`</?[A-Za-z][\w-]*[^<>]*>`)
-)
+var tag = regexp.MustCompile(`</?[A-Za-z][\w-]*[^<>]*>`)
 
 // untagged is a message the agent or a harness wrapped in tags, as words.
 func untagged(s string) string { return title(tag.ReplaceAllString(s, " ")) }
 
-// title is a prompt made one short line.
+// title is a prompt made one short line: each run of ASCII white space (as
+// regexp's \s) one space, trimmed, and cut at 160 characters. It reads only
+// as far as it keeps, and one past: a pasted file as a prompt went through
+// a regexp and into runes whole, 0.45 GB of a cold start's first 2 minutes.
 func title(s string) string {
-	s = strings.TrimSpace(space.ReplaceAllString(s, " "))
-	if r := []rune(s); len(r) > 160 {
-		s = strings.TrimSpace(string(r[:160])) + "…"
+	const most = 160
+	s = strings.TrimLeftFunc(s, unicode.IsSpace)
+	b := make([]byte, 0, min(len(s), 4*most))
+	n, in, i := 0, false, 0 // runes kept; in a run of \s
+	for ; i < len(s) && n < most; i++ {
+		switch c := s[i]; c {
+		case '\t', '\n', '\f', '\r', ' ':
+			if !in {
+				b, n, in = append(b, ' '), n+1, true
+			}
+		default:
+			_, w := utf8.DecodeRuneInString(s[i:])
+			b, n, in = append(b, s[i:i+w]...), n+1, false
+			i += w - 1
+		}
 	}
-	return s
+	if strings.IndexFunc(s[i:], func(r rune) bool { return !unicode.IsSpace(r) }) < 0 {
+		return strings.TrimRightFunc(string(b), unicode.IsSpace)
+	}
+	// as []rune made it: each byte not UTF-8 one U+FFFD
+	return strings.TrimSpace(string([]rune(string(b)))) + "…"
 }
 
 // ---- pricing ----------------------------------------------------------------
@@ -1644,7 +1974,16 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 // it: the Sessions page shows it, and its conversation, Markdown and
 // Terminal open from it as from any other (#2273).
 func Find(agent, id string) (Session, bool) {
-	for _, s := range List(0) {
+	alias := provider.UsageAlias()
+	s, ok := findListed(agent, id)
+	if ok && alias != nil {
+		aliasSession(&s, alias)
+	}
+	return s, ok
+}
+
+func findListed(agent, id string) (Session, bool) {
+	for _, s := range listSessions(0) {
 		if s.Agent == agent && s.ID == id {
 			return s, true
 		}
@@ -1722,7 +2061,7 @@ func Titles(keys []string) map[string]string {
 	identities := codexIdentitySnapshot(fs)
 	price := pricer()
 	for k, g := range groups {
-		if s, ok := assemble(g, price); ok {
+		if s, ok := assembleListed(g, price); ok {
 			setSessionCodexIdentity(&s, identities)
 			setSessionCodexTaskTitle(&s, taskTitles)
 			if s.Title == "" {
@@ -1737,7 +2076,11 @@ func Titles(keys []string) map[string]string {
 // Get is the session whose files are grouped under key (a Summary's Key),
 // however long ago it was at work.
 func Get(key string) (Session, bool) {
+	alias := provider.UsageAlias()
 	s, ok, _ := get(key)
+	if ok && alias != nil {
+		aliasSession(&s, alias)
+	}
 	return s, ok
 }
 
